@@ -10,6 +10,7 @@ import Foundation
 import UIKit
 import Metal
 import MetalKit
+import ObjectiveC
 
 /// VAP 纹理加载器
 class PCTextureLoader {
@@ -32,6 +33,45 @@ class PCTextureLoader {
         return nil
     }
     #else
+
+    private static let textureLoaderLock = NSLock()
+    private static var textureLoaders: [ObjectIdentifier: MTKTextureLoader] = [:]
+    private static var associatedTextureCacheKey: UInt8 = 0
+    private static let textureLoaderOptions: [MTKTextureLoader.Option: Any] = [
+        .origin: MTKTextureLoader.Origin.flippedVertically,
+        .SRGB: false
+    ]
+
+    /// 按 `MTLDevice` 复用 `MTKTextureLoader`，避免每次 `loadTexture` 新建 loader 导致 ImageIO 内部对象被 Leaks 标为 ROOT LEAK。
+    private static func textureLoader(for device: MTLDevice) -> MTKTextureLoader {
+        let key = ObjectIdentifier(device)
+        textureLoaderLock.lock()
+        defer { textureLoaderLock.unlock() }
+        if let loader = textureLoaders[key] {
+            return loader
+        }
+        let loader = MTKTextureLoader(device: device)
+        textureLoaders[key] = loader
+        return loader
+    }
+
+    private static func cachedTexture(for image: UIImage, device: MTLDevice) -> MTLTexture? {
+        let deviceKey = textureCacheKey(for: device)
+        let cache = objc_getAssociatedObject(image, &associatedTextureCacheKey) as? [String: MTLTexture]
+        return cache?[deviceKey]
+    }
+
+    private static func storeCachedTexture(_ texture: MTLTexture, for image: UIImage, device: MTLDevice) {
+        let deviceKey = textureCacheKey(for: device)
+        var cache = objc_getAssociatedObject(image, &associatedTextureCacheKey) as? [String: MTLTexture] ?? [:]
+        cache[deviceKey] = texture
+        objc_setAssociatedObject(image, &associatedTextureCacheKey, cache, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+    }
+
+    private static func textureCacheKey(for device: MTLDevice) -> String {
+        let devicePointer = UInt(bitPattern: Unmanaged.passUnretained(device as AnyObject).toOpaque())
+        return "\(devicePointer)"
+    }
     
     /// 加载 VAP 颜色填充缓冲区
     /// - Parameters:
@@ -71,21 +111,28 @@ class PCTextureLoader {
             return nil
         }
         
-        let loader = MTKTextureLoader(device: device)
-        let options: [MTKTextureLoader.Option: Any] = [
-            .origin: MTKTextureLoader.Origin.flippedVertically,
-            .SRGB: false
-        ]
+        guard let cgImage = image.cgImage else {
+            PCVAPError(kPCVAPModuleCommon, "attemp to loadTexture with nil cgImage")
+            return nil
+        }
         
+        if let cached = cachedTexture(for: image, device: device) {
+            return cached
+        }
+
+        let loader = textureLoader(for: device)
         do {
-            guard let cgImage = image.cgImage else {
-                PCVAPError(kPCVAPModuleCommon, "attemp to loadTexture with nil cgImage")
-                return nil
+            let texture = try autoreleasepool {
+                try loader.newTexture(cgImage: cgImage, options: textureLoaderOptions)
             }
-            let texture = try loader.newTexture(cgImage: cgImage, options: options)
+            storeCachedTexture(texture, for: image, device: device)
             return texture
         } catch {
-            PCVAPError(kPCVAPModuleCommon, "loadTexture error:\(error)")
+            if let texture = textureFromBitmapUpload(image: image, device: device) {
+                storeCachedTexture(texture, for: image, device: device)
+                return texture
+            }
+            PCVAPError(kPCVAPModuleCommon, "loadTexture fallback(bitmap upload) error: \(error)")
             return nil
         }
     }
@@ -205,6 +252,67 @@ class PCTextureLoader {
         
         textSize = stringSize
         return isBold ? UIFont.boldSystemFont(ofSize: fontSize) : UIFont.systemFont(ofSize: fontSize)
+    }
+    
+    /// Build texture by rendering image into RGBA bitmap memory and uploading bytes directly.
+    private static func textureFromBitmapUpload(image: UIImage, device: MTLDevice) -> MTLTexture? {
+        let scale = max(image.scale, 1)
+        let width = Int(image.size.width * scale)
+        let height = Int(image.size.height * scale)
+        guard width > 0, height > 0 else {
+            print("lt -- vap texture loader bitmap invalid size w:\(width) h:\(height)")
+            return nil
+        }
+        
+        let bytesPerPixel = 4
+        let bytesPerRow = width * bytesPerPixel
+        let bufferSize = bytesPerRow * height
+        var pixelData = [UInt8](repeating: 0, count: bufferSize)
+        
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+        guard let context = CGContext(
+            data: &pixelData,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: bytesPerRow,
+            space: colorSpace,
+            bitmapInfo: bitmapInfo
+        ) else {
+            print("lt -- vap texture loader bitmap context create failed")
+            return nil
+        }
+        
+        // Match MTKTextureLoader.Option.origin = .flippedVertically behavior.
+        context.translateBy(x: 0, y: CGFloat(height))
+        context.scaleBy(x: 1, y: -1)
+        let drawRect = CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height))
+        
+        if let cgImage = image.cgImage {
+            context.draw(cgImage, in: drawRect)
+        } else {
+            UIGraphicsPushContext(context)
+            image.draw(in: drawRect)
+            UIGraphicsPopContext()
+        }
+        
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba8Unorm,
+            width: width,
+            height: height,
+            mipmapped: false
+        )
+        descriptor.usage = [.shaderRead]
+        
+        guard let texture = device.makeTexture(descriptor: descriptor) else {
+            print("lt -- vap texture loader makeTexture failed w:\(width) h:\(height)")
+            return nil
+        }
+        
+        let region = MTLRegionMake2D(0, 0, width, height)
+        texture.replace(region: region, mipmapLevel: 0, withBytes: pixelData, bytesPerRow: bytesPerRow)
+        return texture
     }
     
     #endif

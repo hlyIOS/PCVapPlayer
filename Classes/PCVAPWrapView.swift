@@ -27,8 +27,8 @@ public protocol PCVAPWrapViewDelegate: AnyObject {
     /// 开始播放
     func vapWrap_viewDidStartPlayMP4(_ container: PCVAPView)
     
-    /// 播放到指定帧
-    func vapWrap_viewDidPlayMP4AtFrame(_ frame: PCMP4AnimatedImageFrame, view: PCVAPView)
+    /// 播放到指定帧（异步回调时若已 stop 可能为 nil）
+    func vapWrap_viewDidPlayMP4AtFrame(_ frame: PCMP4AnimatedImageFrame?, view: PCVAPView)
     
     /// 停止播放
     func vapWrap_viewDidStopPlayMP4(_ lastFrameIndex: Int, view: PCVAPView)
@@ -39,8 +39,8 @@ public protocol PCVAPWrapViewDelegate: AnyObject {
     /// 播放失败
     func vapWrap_viewDidFailPlayMP4(_ error: Error)
     
-    /// 替换配置中的资源占位符（不处理直接返回 tag）
-    func vapWrapview_contentForVapTag(_ tag: String, resource: VAPSourceInfo) -> String?
+    /// 替换配置中的资源占位符，可返回 String / UIImage 等
+    func vapWrapview_contentForVapTag(_ tag: String, resource: VAPSourceInfo) -> Any?
     
     /// 加载 VAP 图片
     func vapWrapView_loadVapImage(with urlStr: String, context: [String: Any], completion: @escaping PCVAPImageCompletionBlock)
@@ -50,11 +50,11 @@ public protocol PCVAPWrapViewDelegate: AnyObject {
 extension PCVAPWrapViewDelegate {
     func vapWrap_viewshouldStartPlayMP4(_ container: PCVAPView, config: PCVAPConfigModel) -> Bool { return true }
     func vapWrap_viewDidStartPlayMP4(_ container: PCVAPView) {}
-    func vapWrap_viewDidPlayMP4AtFrame(_ frame: PCMP4AnimatedImageFrame, view: PCVAPView) {}
+    func vapWrap_viewDidPlayMP4AtFrame(_ frame: PCMP4AnimatedImageFrame?, view: PCVAPView) {}
     func vapWrap_viewDidStopPlayMP4(_ lastFrameIndex: Int, view: PCVAPView) {}
     func vapWrap_viewDidFinishPlayMP4(_ totalFrameCount: Int, view: PCVAPView) {}
     func vapWrap_viewDidFailPlayMP4(_ error: Error) {}
-    func vapWrapview_contentForVapTag(_ tag: String, resource: VAPSourceInfo) -> String? { return tag }
+    func vapWrapview_contentForVapTag(_ tag: String, resource: VAPSourceInfo) -> Any? { return tag as String }
     func vapWrapView_loadVapImage(with urlStr: String, context: [String: Any], completion: @escaping PCVAPImageCompletionBlock) {
         completion(nil, NSError(domain: "PCVAPWrapView", code: -1, userInfo: [NSLocalizedDescriptionKey: "Not implemented"]), urlStr)
     }
@@ -69,15 +69,51 @@ extension PCVAPWrapViewDelegate {
 /// 播放完成后会自动移除内部的 PCVAPView（可选）
 public class PCVAPWrapView: UIView {
     /// VAP 内容模式，默认为 scaleToFill
-    public var vapContentMode: PCVAPWrapViewContentMode = .scaleToFill
+    public var vapContentMode: PCVAPWrapViewContentMode = .aspectFit
+    
+    /// 与系统 `contentMode` 同步：外部设置 `view.contentMode`（如 `displayView.contentMode`）时会更新 `vapContentMode`。
+    /// 仅映射 scaleToFill / scaleAspectFit / scaleAspectFill，其它模式不改变 `vapContentMode`。
+    public override var contentMode: UIView.ContentMode {
+        get { super.contentMode }
+        set {
+            super.contentMode = newValue
+            switch newValue {
+            case .scaleToFill:
+                vapContentMode = .scaleToFill
+            case .scaleAspectFit:
+                vapContentMode = .aspectFit
+            case .scaleAspectFill:
+                vapContentMode = .aspectFill
+            default:
+                break
+            }
+        }
+    }
     
     /// 是否在播放完成后自动移除内部 PCVAPView
     /// 如果外部用法会复用当前 View，可以不移除
     public var autoDestoryAfterFinish: Bool = true
+
+    /// 停止后是否清空画面；为 false 时保留最后一次渲染结果。
+    public var clearsAfterStop: Bool = true {
+        didSet {
+            vapView?.hwd_clearsAfterStop = clearsAfterStop
+        }
+    }
+
+    /// 在页面/应用切换（退后台）时 VAP 的行为
+    public var enterBackgroundOperation: PCHWDMP4EBOperationType = .stop {
+        didSet {
+            vapView?.hwd_enterBackgroundOP = enterBackgroundOperation
+        }
+    }
     
     private weak var delegate: PCVAPWrapViewDelegate?
     internal var vapView: PCVAPView?
-    
+
+    /// 最近一次用于计算 `vapView` 布局的配置；父视图尺寸变化时在 `layoutSubviews` 中重新套用，避免全屏开播后切入小窗时内层仍为大尺寸。
+    private var lastContentLayoutConfig: PCVAPConfigModel?
+
     public override init(frame: CGRect) {
         super.init(frame: frame)
         commonInit()
@@ -96,6 +132,8 @@ public class PCVAPWrapView: UIView {
     internal func initPCVAPViewIfNeed() {
         if vapView == nil {
             vapView = PCVAPView(frame: bounds)
+            vapView?.hwd_clearsAfterStop = clearsAfterStop
+            vapView?.hwd_enterBackgroundOP = enterBackgroundOperation
             addSubview(vapView!)
         }
     }
@@ -137,6 +175,11 @@ public class PCVAPWrapView: UIView {
     
     // MARK: - UIView Override
     
+    public override func layoutSubviews() {
+        super.layoutSubviews()
+        relayoutVapViewIfNeeded()
+    }
+
     /// 自身不响应，仅子视图响应
     public override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         if !isUserInteractionEnabled || isHidden || alpha < 0.01 {
@@ -156,14 +199,36 @@ public class PCVAPWrapView: UIView {
     }
     
     // MARK: - Private Methods
+
+    private func relayoutVapViewIfNeeded() {
+        guard let vapView = vapView, vapView.superview === self else { return }
+        guard bounds.width > 0, bounds.height > 0 else { return }
+
+        if let config = lastContentLayoutConfig, config.info != nil {
+            setupContentMode(with: config)
+        } else {
+            vapView.frame = bounds
+        }
+    }
     
     /// 设置内容模式
     private func setupContentMode(with config: PCVAPConfigModel) {
-        guard let info = config.info else { return }
-        
+        guard let vapView = vapView else { return }
+
         let layoutWidth = bounds.width
         let layoutHeight = bounds.height
+        guard layoutWidth > 0, layoutHeight > 0 else { return }
+
+        guard let info = config.info else {
+            vapView.frame = bounds
+            return
+        }
+
         let layoutRatio = layoutWidth / layoutHeight
+        guard info.size.height > 0 else {
+            vapView.frame = bounds
+            return
+        }
         let videoRatio = info.size.width / info.size.height
         
         var realWidth: CGFloat = 0
@@ -171,8 +236,7 @@ public class PCVAPWrapView: UIView {
         
         switch vapContentMode {
         case .scaleToFill:
-            // 不做处理，使用默认大小
-            break
+            vapView.frame = bounds
             
         case .aspectFit:
             if layoutRatio < videoRatio {
@@ -182,8 +246,8 @@ public class PCVAPWrapView: UIView {
                 realHeight = layoutHeight
                 realWidth = videoRatio * realHeight
             }
-            vapView?.frame = CGRect(x: 0, y: 0, width: realWidth, height: realHeight)
-            vapView?.center = center
+            vapView.frame = CGRect(x: 0, y: 0, width: realWidth, height: realHeight)
+            vapView.center = CGPoint(x: bounds.midX, y: bounds.midY)
             
         case .aspectFill:
             if layoutRatio > videoRatio {
@@ -193,8 +257,8 @@ public class PCVAPWrapView: UIView {
                 realHeight = layoutHeight
                 realWidth = videoRatio * realHeight
             }
-            vapView?.frame = CGRect(x: 0, y: 0, width: realWidth, height: realHeight)
-            vapView?.center = center
+            vapView.frame = CGRect(x: 0, y: 0, width: realWidth, height: realHeight)
+            vapView.center = CGPoint(x: bounds.midX, y: bounds.midY)
         }
     }
 }
@@ -203,29 +267,41 @@ public class PCVAPWrapView: UIView {
 
 extension PCVAPWrapView: PCHWDMP4PlayDelegate {
     public func shouldStartPlayMP4(_ container: PCVAPView, config: PCVAPConfigModel) -> Bool {
-        setupContentMode(with: config)
-        
-        if let delegate = delegate {
-            return delegate.vapWrap_viewshouldStartPlayMP4(container, config: config)
+        if config.info != nil {
+            lastContentLayoutConfig = config
+        } else {
+            lastContentLayoutConfig = nil
         }
-        return true
+        setupContentMode(with: config)
+
+        let allowStart: Bool
+        if let delegate = delegate {
+            allowStart = delegate.vapWrap_viewshouldStartPlayMP4(container, config: config)
+        } else {
+            allowStart = true
+        }
+        if !allowStart {
+            lastContentLayoutConfig = nil
+        }
+        return allowStart
     }
     
     public func viewDidStartPlayMP4(_ container: PCVAPView) {
         delegate?.vapWrap_viewDidStartPlayMP4(container)
     }
     
-    public func viewDidPlayMP4AtFrame(_ frame: PCMP4AnimatedImageFrame, view: PCVAPView) {
+    public func viewDidPlayMP4AtFrame(_ frame: PCMP4AnimatedImageFrame?, view: PCVAPView) {
         delegate?.vapWrap_viewDidPlayMP4AtFrame(frame, view: view)
     }
     
     public func viewDidStopPlayMP4(_ lastFrameIndex: Int, view: PCVAPView) {
         delegate?.vapWrap_viewDidStopPlayMP4(lastFrameIndex, view: view)
         
-        if autoDestoryAfterFinish {
+        if autoDestoryAfterFinish && clearsAfterStop {
             DispatchQueue.main.async { [weak self] in
                 self?.vapView?.removeFromSuperview()
                 self?.vapView = nil
+                self?.lastContentLayoutConfig = nil
             }
         }
     }
@@ -238,7 +314,7 @@ extension PCVAPWrapView: PCHWDMP4PlayDelegate {
         delegate?.vapWrap_viewDidFailPlayMP4(error)
     }
     
-    public func contentForVapTag(_ tag: String, resource: VAPSourceInfo) -> String? {
+    public func contentForVapTag(_ tag: String, resource: VAPSourceInfo) -> Any? {
         return delegate?.vapWrapview_contentForVapTag(tag, resource: resource)
     }
     

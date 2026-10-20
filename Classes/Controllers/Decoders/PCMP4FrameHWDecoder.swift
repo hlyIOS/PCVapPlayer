@@ -31,6 +31,8 @@ let PCMP4HWDErrorDomain = "PCMP4HWDErrorDomain"
 
 /// MP4 硬件解码器
 class PCMP4FrameHWDecoder: PCBaseDecoder {
+    /// 用于判断当前是否已在专用解码队列上执行（避免 `decodeQueue.sync` 同队列死锁）
+    private static let decodeQueueSpecificKey = DispatchSpecificKey<UInt8>()
     private var buffers: PCSafeMutableArray<Any>?
     private var videoStream: Int = -1
     private var outputWidth: Int = 0
@@ -60,6 +62,7 @@ class PCMP4FrameHWDecoder: PCBaseDecoder {
     
     required init(fileInfo: PCBaseDFileInfo) throws {
         self.decodeQueue = DispatchQueue(label: "com.qgame.vap.decode")
+        decodeQueue.setSpecific(key: Self.decodeQueueSpecificKey, value: 1)
         self.buffers = nil
         self.lastDecodeFrame = -1
         
@@ -300,7 +303,7 @@ class PCMP4FrameHWDecoder: PCBaseDecoder {
         var flagOut: VTDecodeInfoFlags = []
         let flags: VTDecodeFrameFlags = []
         
-        PCVAPInfo(kPCVAPModuleCommon, "_decodeFrame(\(frameIndex)): calling VTDecompressionSessionDecodeFrame")
+//        PCVAPInfo(kPCVAPModuleCommon, "_decodeFrame(\(frameIndex)): calling VTDecompressionSessionDecodeFrame")
         status = VTDecompressionSessionDecodeFrame(
             decodeSession,
             sampleBuffer: sampleBuffer,
@@ -308,11 +311,11 @@ class PCMP4FrameHWDecoder: PCBaseDecoder {
             infoFlagsOut: &flagOut
         ) { [weak self] status, infoFlags, imageBuffer, presentationTimeStamp, presentationDuration in
             guard let self = self else { 
-                PCVAPError(kPCVAPModuleCommon, "VTDecompressionSessionDecodeFrame callback: self is nil for frame \(frameIndex)")
+//                PCVAPError(kPCVAPModuleCommon, "VTDecompressionSessionDecodeFrame callback: self is nil for frame \(frameIndex)")
                 return 
             }
             
-            PCVAPInfo(kPCVAPModuleCommon, "VTDecompressionSessionDecodeFrame callback: frame=\(frameIndex), status=\(status), hasPixelBuffer=\(imageBuffer != nil)")
+//            PCVAPInfo(kPCVAPModuleCommon, "VTDecompressionSessionDecodeFrame callback: frame=\(frameIndex), status=\(status), hasPixelBuffer=\(imageBuffer != nil)")
             self.handleDecodePixelBuffer(
                 pixelBuffer: imageBuffer,
                 sampleBuffer: sampleBuffer,
@@ -385,19 +388,20 @@ class PCMP4FrameHWDecoder: PCBaseDecoder {
         newFrame.defaultFps = mp4Parser?.fps ?? 0
         newFrame.pts = currentPts
         
-        // 插入到缓冲区
+        // 插入到缓冲区（整段在锁内执行，避免 count 与 object(at:) 之间被其他线程修改导致越界）
         if let buffers = buffers {
-            PCVAPInfo(kPCVAPModuleCommon, "handleDecodePixelBuffer(\(frameIndex)): adding frame to buffers, current buffer count=\(buffers.count)")
-            buffers.add(newFrame)
-            
-            // 排序 - 需要转换为数组进行排序
-            let array = (0..<buffers.count).compactMap { buffers.object(at: $0) as? PCMP4AnimatedImageFrame }
-            let sortedArray = array.sorted { $0.pts < $1.pts }
-            buffers.removeAllObjects()
-            for frame in sortedArray {
-                buffers.add(frame)
+            buffers.withLock {
+                PCVAPInfo(kPCVAPModuleCommon, "handleDecodePixelBuffer(\(frameIndex)): adding frame to buffers, current buffer count=\(buffers.count)")
+                buffers.add(newFrame)
+                let count = buffers.count
+                let array = (0..<count).compactMap { buffers.object(at: $0) as? PCMP4AnimatedImageFrame }
+                let sortedArray = array.sorted { $0.pts < $1.pts }
+                buffers.removeAllObjects()
+                for frame in sortedArray {
+                    buffers.add(frame)
+                }
+                PCVAPInfo(kPCVAPModuleCommon, "handleDecodePixelBuffer(\(frameIndex)): frame added and sorted, new buffer count=\(buffers.count)")
             }
-            PCVAPInfo(kPCVAPModuleCommon, "handleDecodePixelBuffer(\(frameIndex)): frame added and sorted, new buffer count=\(buffers.count)")
         } else {
             PCVAPError(kPCVAPModuleCommon, "handleDecodePixelBuffer(\(frameIndex)): buffers is nil, cannot add frame")
         }
@@ -593,6 +597,16 @@ class PCMP4FrameHWDecoder: PCBaseDecoder {
         _ = createDecompressionSession()
     }
     
+    /// 必须在 `decodeQueue` 上调用：从关键帧顺序解码到目标帧（中间帧可丢弃）
+    private func decodeFromKeyFrameToCurrent(keyframeIndex: Int, frameIndex: Int) {
+        var currentIndex = keyframeIndex
+        while currentIndex < frameIndex {
+            _decodeFrame(currentIndex, drop: true)
+            currentIndex += 1
+        }
+        _decodeFrame(frameIndex, drop: false)
+    }
+    
     /// Seek 到指定帧：从最近的关键帧解码到目标帧
     /// - Parameter frameIndex: 目标帧索引
     func findKeyFrameAndDecodeToCurrent(_ frameIndex: Int) {
@@ -618,22 +632,17 @@ class PCMP4FrameHWDecoder: PCBaseDecoder {
         
         PCVAPInfo(kPCVAPModuleCommon, "findKeyFrameAndDecodeToCurrent: found keyframe at \(index), decoding to frame \(frameIndex)")
         
-        // seek to last key frame - 在 decodeQueue 中同步执行
-        // 注意：_decodeFrame 是异步的，但我们需要等待目标帧解码完成
-        let semaphore = DispatchSemaphore(value: 0)
-        var targetFrameDecoded = false
-        
-        decodeQueue.sync {
-            var currentIndex = index
-            while currentIndex < frameIndex {
-                _decodeFrame(currentIndex, drop: true)
-                currentIndex += 1
+        // 在 decodeQueue 上执行 seek 解码。若调用方已在 decodeQueue（如 kVTInvalidSessionErr 恢复路径），
+        // 禁止再 sync 同一条串行队列，否则会死锁（见 stack: _dispatch_sync_f_slow）。
+        if DispatchQueue.getSpecific(key: Self.decodeQueueSpecificKey) != nil {
+            decodeFromKeyFrameToCurrent(keyframeIndex: index, frameIndex: frameIndex)
+        } else {
+            decodeQueue.sync { [self] in
+                decodeFromKeyFrameToCurrent(keyframeIndex: index, frameIndex: frameIndex)
             }
-            // 解码目标帧（不丢弃），并等待完成
-            // 注意：我们需要在 handleDecodePixelBuffer 回调中通知完成
-            // 但为了简化，我们先解码，然后等待一小段时间
-            _decodeFrame(frameIndex, drop: false)
         }
+        
+        var targetFrameDecoded = false
         
         // 等待目标帧解码完成（最多等待 2 秒）
         // 注意：这是一个简化的实现，实际应该通过回调来通知

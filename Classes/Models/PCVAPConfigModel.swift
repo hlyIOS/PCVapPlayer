@@ -77,7 +77,8 @@ public class VAPSourceInfo {
     public var type: AttachmentSourceType = ""
     public var loadType: AttachmentSourceLoadType = ""
     public var contentTag: String = ""
-    public var contentTagValue: String = ""
+    /// 占位 tag 的融合值，可为 String（文案/URL）或 UIImage 等，由 vap_contentForTag 返回并写入
+    public var contentTagValue: Any?
     public var color: UIColor?
     public var style: AttachmentSourceStyle = ""
     public var size: CGSize = .zero

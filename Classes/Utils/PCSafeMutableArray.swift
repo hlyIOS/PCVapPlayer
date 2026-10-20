@@ -46,6 +46,12 @@ class PCSafeMutableArray<T>: NSMutableArray {
         return block()
     }
     
+    /// 在锁内执行 block，保证整段逻辑的原子性（可重入，与 NSRecursiveLock 配合）
+    /// 用于需要多步操作保持一致性的场景，避免与其他线程交错导致越界等问题
+    func withLock<T>(_ block: () -> T) -> T {
+        synchronized(block)
+    }
+    
     // MARK: - NSArray Protocol
     
     override var count: Int {

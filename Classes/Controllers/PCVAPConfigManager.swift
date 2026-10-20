@@ -22,8 +22,8 @@ protocol VAPConfigDelegate: AnyObject {
     /// - Parameters:
     ///   - tag: 标签
     ///   - resource: 资源信息
-    /// - Returns: 替换后的内容，不处理直接返回 tag
-    func vap_contentForTag(_ tag: String, resource: VAPSourceInfo) -> String?
+    /// - Returns: 替换后的内容，可为 String（文案/URL）或 UIImage 等，写入 resource.contentTagValue，UIImage 同时写入 sourceImage
+    func vap_contentForTag(_ tag: String, resource: VAPSourceInfo) -> Any?
     
     /// 加载图片（可选）
     /// - Parameters:
@@ -35,8 +35,8 @@ protocol VAPConfigDelegate: AnyObject {
 
 // 提供默认实现（可选方法）
 extension VAPConfigDelegate {
-    func vap_contentForTag(_ tag: String, resource: VAPSourceInfo) -> String? {
-        return tag
+    func vap_contentForTag(_ tag: String, resource: VAPSourceInfo) -> Any? {
+        return tag as String
     }
     
     func vap_loadImage(with urlStr: String, context: [String: Any], completion: @escaping PCVAPImageCompletionBlock) {
@@ -104,47 +104,43 @@ class PCVAPConfigManager {
             delegate?.onVAPConfigResourcesLoaded(model, error: nil)
             return
         }
-        
-        // 处理标签替换
-        if let delegate = delegate {
-            for resource in model.resources {
-                if let content = delegate.vap_contentForTag(resource.contentTag, resource: resource) {
-                    resource.contentTagValue = content
-                }
-            }
-        }
-        
+
         guard let delegate = delegate else {
             return
+        }
+        
+        // 处理标签替换：返回值写入 contentTagValue（Any?），若为 UIImage 同时写入 sourceImage
+        for resource in model.resources {
+            if let content = delegate.vap_contentForTag(resource.contentTag, resource: resource) {
+                resource.contentTagValue = content
+            }
         }
         
         var loadError: Error?
         let group = DispatchGroup()
         
         for resource in model.resources {
-            let tagContent = resource.contentTagValue
+            let tagContent = resource.contentTagValue // 这里没有确定类新年
             
-            PCVAPInfo(kPCVAPModuleCommon, "loadConfigResources: processing resource type=\(resource.type), loadType=\(resource.loadType), tagContent=\(tagContent)")
+            PCVAPInfo(kPCVAPModuleCommon, "loadConfigResources: processing resource type=\(resource.type), loadType=\(resource.loadType), tagContent=\(tagContent ?? "")")
             
             // 处理文本资源
-            if resource.type == kQGAGAttachmentSourceTypeText && resource.loadType == QGAGAttachmentSourceLoadTypeLocal {
+            if resource.type == kQGAGAttachmentSourceTypeText && resource.loadType == QGAGAttachmentSourceLoadTypeLocal, let textTagContent = tagContent as? String {
                 if let color = resource.color {
-                    resource.sourceImage = PCTextureLoader.drawingImageForText(tagContent, color: color, size: resource.size, bold: resource.style == kQGAGAttachmentSourceStyleBoldText)
-                    PCVAPInfo(kPCVAPModuleCommon, "loadConfigResources: generated text image for tag=\(tagContent)")
+                    resource.sourceImage = PCTextureLoader.drawingImageForText(textTagContent, color: color, size: resource.size, bold: resource.style == kQGAGAttachmentSourceStyleBoldText)
+                    PCVAPInfo(kPCVAPModuleCommon, "loadConfigResources: generated text image for tag=\(String(describing: tagContent))")
                 }
             }
-            
-            // 处理本地图片资源
-            if resource.type == kQGAGAttachmentSourceTypeImg && resource.loadType == QGAGAttachmentSourceLoadTypeLocal {
-                // 本地图片资源应该通过 delegate 的 contentForVapTag 方法获取实际路径
-                // 或者直接使用 tagContent 作为本地路径
-                // 这里暂时跳过，因为本地图片通常不需要异步加载
-                PCVAPInfo(kPCVAPModuleCommon, "loadConfigResources: skipping local image resource tag=\(tagContent) (should be handled by contentForVapTag)")
+            // 处理已经传入的图片（contentTagValue 为 UIImage 时）
+            else if resource.type == kQGAGAttachmentSourceTypeImg && resource.sourceImage == nil, let imgTagContent = resource.contentTagValue as? UIImage {
+                resource.sourceImage = imgTagContent
+//                print(
+//                    "lt -- vap source assign tag=\(resource.contentTag) loadType=\(resource.loadType) " +
+//                    "type=\(resource.type) sourceImageAssigned=true hasCGImage=\(imgTagContent.cgImage != nil)"
+//                )
             }
-            
-            // 处理网络图片资源
-            if resource.type == kQGAGAttachmentSourceTypeImg && resource.loadType == QGAGAttachmentSourceLoadTypeNet {
-                let imageURL = tagContent
+            // 让外面做自定义的图片处理：比如下载等等
+            else if resource.type == kQGAGAttachmentSourceTypeImg && resource.loadType == QGAGAttachmentSourceLoadTypeNet && resource.sourceImage == nil, let imageURL = tagContent as? String {
                 let context: [String: Any] = ["resource": resource]
                 
                 var hasLeftGroup = false
@@ -197,21 +193,58 @@ class PCVAPConfigManager {
         guard let model = model else { return }
         
         for resource in model.resources {
-            if let image = resource.sourceImage {
-                resource.texture = PCTextureLoader.loadTexture(with: image, device: device)
+            guard resource.texture == nil else {
                 resource.sourceImage = nil
+                if resource.contentTagValue is UIImage {
+                    resource.contentTagValue = nil
+                }
+                continue
+            }
+
+            if let image = resource.sourceImage {
+                let hasCGImage = image.cgImage != nil
+                resource.texture = PCTextureLoader.loadTexture(with: image, device: device)
+                let textureLoaded = resource.texture != nil
+//                print(
+//                    "lt -- vap texture tag=\(resource.contentTag) loadType=\(resource.loadType) " +
+//                    "type=\(resource.type) hasSourceImage=true hasCGImage=\(hasCGImage) textureLoaded=\(textureLoaded)"
+//                )
+                resource.sourceImage = nil
+                if resource.contentTagValue is UIImage {
+                    resource.contentTagValue = nil
+                }
+            } else if resource.type == kQGAGAttachmentSourceTypeImg {
+//                print(
+//                    "lt -- vap texture tag=\(resource.contentTag) loadType=\(resource.loadType) " +
+//                    "type=\(resource.type) hasSourceImage=false"
+//                )
             }
         }
     }
     
     /// 加载 Metal 缓冲区
+    /// 与 QGVAPlayer 一致：每个 resource 都需要 colorParamsBuffer（融合 attachment 着色器 buffer(1) 必填）。
+    /// 无 color 时传入 nil，PCTextureLoader 会生成 needOriginRGB=1 的默认 buffer，使用纹理原始 RGB。
     /// - Parameter device: Metal 设备
     func loadMTLBuffers(device: MTLDevice) {
         guard let model = model else { return }
         
         for resource in model.resources {
-            if let color = resource.color {
-                resource.colorParamsBuffer = PCTextureLoader.loadVapColorFillBuffer(with: color, device: device)
+            guard resource.colorParamsBuffer == nil else { continue }
+            resource.colorParamsBuffer = PCTextureLoader.loadVapColorFillBuffer(with: resource.color, device: device)
+        }
+    }
+
+    /// 释放配置持有的图片、纹理和 Metal buffer，避免播放结束后关联对象继续持有 GPU 资源。
+    func releaseLoadedResources() {
+        guard let model = model else { return }
+
+        for resource in model.resources {
+            resource.sourceImage = nil
+            resource.texture = nil
+            resource.colorParamsBuffer = nil
+            if resource.contentTagValue is UIImage {
+                resource.contentTagValue = nil
             }
         }
     }

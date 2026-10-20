@@ -32,24 +32,24 @@ var externalPCLogger: PCLoggerFunc?
 /// 内部日志处理器
 func internalPCLoggerHandler(level: LogLevel, file: String, line: Int, function: String, module: String, format: String, _ arguments: CVarArg...) {
     #if DEBUG
-    let message = String(format: format, arguments: arguments)
-    let fileName = (file as NSString).lastPathComponent
+//    let message = String(format: format, arguments: arguments)
+//    let fileName = (file as NSString).lastPathComponent
     // 可以在这里添加日志输出
     #endif
 }
 
 /// 日志宏
 func VAPPCLogger(_ level: LogLevel, _ module: String, _ format: String, _ arguments: CVarArg...) {
-    let file = #file
-    let line = #line
-    let function = #function
+//    let file = #file
+//    let line = #line
+//    let function = #function
     
-    if let externalPCLogger = externalPCLogger {
-        let message = String(format: format, arguments: arguments)
-        externalPCLogger(level, file, line, function, module, message)
-    } else {
-        internalPCLoggerHandler(level: level, file: file, line: line, function: function, module: module, format: format, arguments)
-    }
+//    if let externalPCLogger = externalPCLogger {
+//        let message = String(format: format, arguments: arguments)
+//        externalPCLogger(level, file, line, function, module, message)
+//    } else {
+//        internalPCLoggerHandler(level: level, file: file, line: line, function: function, module: module, format: format, arguments)
+//    }
 }
 
 func PCVAPError(_ module: String, _ format: String, _ arguments: CVarArg...) {

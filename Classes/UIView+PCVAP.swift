@@ -24,7 +24,7 @@ public protocol PCHWDMP4PlayDelegate: AnyObject {
     func viewDidStartPlayMP4(_ container: PCVAPView)
     
     /// 播放到指定帧
-    func viewDidPlayMP4AtFrame(_ frame: PCMP4AnimatedImageFrame, view: PCVAPView)
+    func viewDidPlayMP4AtFrame(_ frame: PCMP4AnimatedImageFrame?, view: PCVAPView)
     
     /// 停止播放
     func viewDidStopPlayMP4(_ lastFrameIndex: Int, view: PCVAPView)
@@ -37,8 +37,8 @@ public protocol PCHWDMP4PlayDelegate: AnyObject {
     
     // MARK: - VAP APIs
     
-    /// 替换配置中的资源占位符（不处理直接返回 tag）
-    func contentForVapTag(_ tag: String, resource: VAPSourceInfo) -> String?
+    /// 替换配置中的资源占位符，可返回 String / UIImage 等，写入 resource.contentTagValue
+    func contentForVapTag(_ tag: String, resource: VAPSourceInfo) -> Any?
     
     /// 由于组件内不包含网络图片加载的模块，因此需要外部支持图片加载
     func loadVapImage(withURL urlStr: String, context: [String: Any]?, completion: @escaping PCVAPImageCompletionBlock)
@@ -58,7 +58,7 @@ extension PCHWDMP4PlayDelegate {
     public func viewDidStartPlayMP4(_ container: PCVAPView) {}
     
     /// 默认实现：空实现
-    public func viewDidPlayMP4AtFrame(_ frame: PCMP4AnimatedImageFrame, view: PCVAPView) {}
+    public func viewDidPlayMP4AtFrame(_ frame: PCMP4AnimatedImageFrame?, view: PCVAPView) {}
     
     /// 默认实现：空实现
     public func viewDidStopPlayMP4(_ lastFrameIndex: Int, view: PCVAPView) {}
@@ -70,8 +70,8 @@ extension PCHWDMP4PlayDelegate {
     public func viewDidFailPlayMP4(_ error: Error) {}
     
     /// 默认实现：返回 nil（不处理占位符）
-    public func contentForVapTag(_ tag: String, resource: VAPSourceInfo) -> String? { 
-        return nil 
+    public func contentForVapTag(_ tag: String, resource: VAPSourceInfo) -> Any? {
+        return nil
     }
     
     /// 默认实现：空实现（不加载图片）
@@ -84,31 +84,32 @@ public extension UIView {
     // MARK: - Associated Object Keys
     
     private struct AssociatedKeys {
-        static var hwdDelegate = "MP4PlayDelegate"
-        static var hwdCurrentFrameInstance = "hwd_currentFrameInstance"
-        static var hwdFileInfo = "hwd_fileInfo"
-        static var hwdDecodeManager = "hwd_decodeManager"
-        static var hwdDecodeConfig = "hwd_decodeConfig"
-        static var hwdCallbackQueue = "hwd_callbackQueue"
-        static var hwdMetalView = "hwd_metalView"
-        static var vapMetalView = "vap_metalView"
-        static var hwdConfigManager = "hwd_configManager"
-        static var vapRenderQueue = "vap_renderQueue"
-        static var hwdMP4FilePath = "hwd_MP4FilePath"
+        static var hwdDelegate: UInt8 = 0
+        static var hwdCurrentFrameInstance: UInt8 = 0
+        static var hwdFileInfo: UInt8 = 0
+        static var hwdDecodeManager: UInt8 = 0
+        static var hwdDecodeConfig: UInt8 = 0
+        static var hwdCallbackQueue: UInt8 = 0
+        static var hwdMetalView: UInt8 = 0
+        static var vapMetalView: UInt8 = 0
+        static var hwdConfigManager: UInt8 = 0
+        static var vapRenderQueue: UInt8 = 0
+        static var hwdMP4FilePath: UInt8 = 0
         
         // C types
-        static var hwdOnPause = "hwd_onPause"
-        static var hwdOnSeek = "hwd_onSeek"
-        static var hwdWasPausedBeforeSeek = "hwd_wasPausedBeforeSeek"
-        static var hwdSeekTargetFrame = "hwd_seekTargetFrame"
-        static var hwdEnterBackgroundOP = "hwd_enterBackgroundOP"
-        static var hwdRenderByOpenGL = "hwd_renderByOpenGL"
-        static var hwdIsFinish = "hwd_isFinish"
-        static var hwdFps = "hwd_fps"
-        static var hwdBlendMode = "hwd_blendMode"
-        static var hwdRepeatCount = "hwd_repeatCount"
-        static var vapEnableOldVersion = "vap_enableOldVersion"
-        static var vapIsMute = "vap_isMute"
+        static var hwdOnPause: UInt8 = 0
+        static var hwdOnSeek: UInt8 = 0
+        static var hwdWasPausedBeforeSeek: UInt8 = 0
+        static var hwdSeekTargetFrame: UInt8 = 0
+        static var hwdEnterBackgroundOP: UInt8 = 0
+        static var hwdRenderByOpenGL: UInt8 = 0
+        static var hwdIsFinish: UInt8 = 0
+        static var hwdFps: UInt8 = 0
+        static var hwdBlendMode: UInt8 = 0
+        static var hwdRepeatCount: UInt8 = 0
+        static var hwdClearsAfterStop: UInt8 = 0
+        static var vapEnableOldVersion: UInt8 = 0
+        static var vapIsMute: UInt8 = 0
     }
     
     // MARK: - Properties
@@ -127,8 +128,20 @@ public extension UIView {
             if let delegate = newValue, !(delegate is PCWeakProxy) {
                 weakDelegate = PCWeakProxy(target: delegate)
             }
-            objc_setAssociatedObject(self, &AssociatedKeys.hwdDelegate, weakDelegate, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+            objc_setAssociatedObject(self, &AssociatedKeys.hwdDelegate, weakDelegate, .OBJC_ASSOCIATION_RETAIN)
         }
+    }
+
+    private func hwd_delegateSnapshot() -> PCHWDMP4PlayDelegate? {
+        if Thread.isMainThread {
+            return hwd_Delegate
+        }
+
+        var delegate: PCHWDMP4PlayDelegate?
+        DispatchQueue.main.sync {
+            delegate = hwd_Delegate
+        }
+        return delegate
     }
     
     /// 当前帧
@@ -330,6 +343,18 @@ public extension UIView {
         }
     }
     
+    var hwd_clearsAfterStop: Bool {
+        get {
+            if let value = objc_getAssociatedObject(self, &AssociatedKeys.hwdClearsAfterStop) as? NSNumber {
+                return value.boolValue
+            }
+            return true
+        }
+        set {
+            objc_setAssociatedObject(self, &AssociatedKeys.hwdClearsAfterStop, NSNumber(value: newValue), .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+        }
+    }
+
     private var vap_enableOldVersion: Bool {
         get {
             if let value = objc_getAssociatedObject(self, &AssociatedKeys.vapEnableOldVersion) as? NSNumber {
@@ -505,65 +530,75 @@ public extension UIView {
         hwd_repeatCount = repeatCount
         hwd_Delegate = delegate
         
-        if hwd_Delegate != nil && hwd_callbackQueue == nil {
+        if hwd_delegateSnapshot() != nil && hwd_callbackQueue == nil {
             let queue = OperationQueue()
             queue.maxConcurrentOperationCount = 1
             hwd_callbackQueue = queue
         }
         
-        // MP4 info
+        // MP4 box parse off main thread; UI/decode setup continues on main
         let fileInfo = PCMP4HWDFileInfo(filePath: filePath)
-        fileInfo.mp4Parser?.parse()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            fileInfo.mp4Parser?.parse()
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.p_continuePlayHWDMP4(fileInfo: fileInfo, blendMode: blendMode)
+            }
+        }
+    }
+
+    private func p_continuePlayHWDMP4(fileInfo: PCMP4HWDFileInfo, blendMode: PCTextureBlendMode) {
+        assert(Thread.isMainThread, "HWDMP4 continue play must run on the main thread.")
+        if hwd_isFinish {
+            return
+        }
         hwd_fileInfo = fileInfo
-        
-        // Config manager
+
+        hwd_releaseConfigResources()
         let configManager = PCVAPConfigManager(fileInfo: fileInfo)
         configManager.delegate = self
         hwd_configManager = configManager
-        
-        // 修复：与 OC 版本保持一致，直接访问 model.info.version（OC 版本假设 model 一定存在）
+
         if let model = configManager.model, let version = model.info?.version, version > PCVapMaxCompatibleVersion {
             PCVAPError(kPCVAPModuleCommon, "playHWDMP4 error! not compatible vap version:\(version)!")
             stopHWDMP4()
             return
         }
-        
+
         if !configManager.hasValidConfig && !vap_enableOldVersion {
             PCVAPError(kPCVAPModuleCommon, "playHWDMP4 error! don't has vapc box and enableOldVersion is false!")
             let error = NSError(domain: "PCVapPlayer", code: -1, userInfo: [NSLocalizedDescriptionKey: "视频文件不包含 vapc box，且未启用旧版本支持。请在播放前调用 enableOldVersion(true)"])
+            let delegate = hwd_delegateSnapshot()
             hwd_callbackQueue?.addOperation {
-                self.hwd_Delegate?.viewDidFailPlayMP4(error)
+                delegate?.viewDidFailPlayMP4(error)
             }
             stopHWDMP4()
             return
         }
-        
-        // Reset
+
         hwd_currentFrameInstance = nil
         hwd_decodeManager = nil
         hwd_onPause = false
-        
+
         if hwd_decodeConfig == nil {
             hwd_decodeConfig = PCAnimatedImageDecodeConfig.defaultConfig()
         }
-        
-        // Metal view (iOS 15+ 只使用 Metal)
+
         hwd_loadMetalViewIfNeed(mode: blendMode)
-        
+
         if UIDevice.current.hwd_isSimulator {
             PCVAPError(kPCVAPModuleCommon, "playHWDMP4 error! not allowed in Simulator!")
             stopHWDMP4()
             return
         }
-        
+
         if vap_renderQueue == nil {
             vap_renderQueue = DispatchQueue(label: "com.qgame.vap.render", qos: .default, attributes: [], autoreleaseFrequency: .inherit)
         }
-        
+
         hwd_decodeManager = PCAnimatedImageDecodeManager(fileInfo: hwd_fileInfo!, config: hwd_decodeConfig!, delegate: self)
-        // 设置音频播放位置监听
         hwd_decodeManager?.audioPositionDelegate = self
-        hwd_configManager?.loadConfigResources() // 必须按先加载必要资源才能播放 - onVAPConfigResourcesLoaded
+        hwd_configManager?.loadConfigResources()
     }
     
     private func hwd_registerNotification() {
@@ -653,6 +688,13 @@ public extension UIView {
     }
     
     private func hwd_stopHWDMP4() {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async {
+                self.hwd_stopHWDMP4()
+            }
+            return
+        }
+
         PCVAPInfo(kPCVAPModuleCommon, "hwd stop playing")
         hwd_repeatCount = 0
         
@@ -664,34 +706,54 @@ public extension UIView {
         hwd_isFinish = true
         hwd_onPause = true
         
-        if let metalView = hwd_metalView {
-            metalView.dispose()
-        }
-        
-        if let vapMetalView = vap_metalView {
-            vapMetalView.dispose()
+        if hwd_clearsAfterStop {
+            if let metalView = hwd_metalView {
+                metalView.dispose()
+            }
+
+            if let vapMetalView = vap_metalView {
+                vapMetalView.dispose()
+            }
         }
         
         hwd_decodeManager?.tryToStopAudioPlay()
         
+        let delegate = hwd_delegateSnapshot()
+        let lastFrameIndex = hwd_currentFrame?.frameIndex ?? 0
         hwd_callbackQueue?.addOperation {
-            if let delegate = self.hwd_Delegate {
-                delegate.viewDidStopPlayMP4(self.hwd_currentFrame?.frameIndex ?? 0, view: self)
+            if let delegate = delegate {
+                delegate.viewDidStopPlayMP4(lastFrameIndex, view: self)
             }
         }
         
         hwd_decodeManager = nil
         hwd_decodeConfig = nil
         hwd_currentFrameInstance = nil
+        hwd_releaseConfigResources()
         hwd_fileInfo = nil
+    }
+
+    private func hwd_releaseConfigResources() {
+        hwd_configManager?.delegate = nil
+        hwd_configManager?.releaseLoadedResources()
+        hwd_configManager = nil
     }
     
     private func hwd_didFinishDisplay() {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async {
+                self.hwd_didFinishDisplay()
+            }
+            return
+        }
+
         PCVAPInfo(kPCVAPModuleCommon, "hwd didFinishDisplay")
         
+        let delegate = hwd_delegateSnapshot()
+        let totalFrameCount = (hwd_currentFrame?.frameIndex ?? 0) + 1
         hwd_callbackQueue?.addOperation {
-            if let delegate = self.hwd_Delegate {
-                delegate.viewDidFinishPlayMP4((self.hwd_currentFrame?.frameIndex ?? 0) + 1, view: self)
+            if let delegate = delegate {
+                delegate.viewDidFinishPlayMP4(totalFrameCount, view: self)
             }
         }
         
@@ -702,13 +764,13 @@ public extension UIView {
         if currentCount == -1 {
             // 无限循环，不减1
             PCVAPInfo(kPCVAPModuleCommon, "continue to display. currentCount:\(currentCount)")
-            p_playHWDMP4(hwd_fileInfo?.filePath ?? "", fps: hwd_fps, blendMode: hwd_blendMode, repeatCount: currentCount, delegate: hwd_Delegate)
+            p_playHWDMP4(hwd_fileInfo?.filePath ?? "", fps: hwd_fps, blendMode: hwd_blendMode, repeatCount: currentCount, delegate: delegate)
             return
         } else if currentCount > 0 {
             // 先减1再继续播放
             currentCount -= 1
             PCVAPInfo(kPCVAPModuleCommon, "continue to display. currentCount:\(currentCount)")
-            p_playHWDMP4(hwd_fileInfo?.filePath ?? "", fps: hwd_fps, blendMode: hwd_blendMode, repeatCount: currentCount, delegate: hwd_Delegate)
+            p_playHWDMP4(hwd_fileInfo?.filePath ?? "", fps: hwd_fps, blendMode: hwd_blendMode, repeatCount: currentCount, delegate: delegate)
             return
         }
         
@@ -768,10 +830,18 @@ public extension UIView {
         hwd_registerNotification()
     }
     
-    private func hwd_loadMetalDataIfNeed() {
-        guard let device = kPCHWDMetalRendererDevice else { return }
-        hwd_configManager?.loadMTLTextures(device: device) // 加载所需的纹理数据
-        hwd_configManager?.loadMTLBuffers(device: device) // 加载所需的 buffer
+    private func hwd_loadMetalDataIfNeed(completion: @escaping () -> Void) {
+        guard let device = kPCHWDMetalRendererDevice, let configManager = hwd_configManager else {
+            completion()
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            configManager.loadMTLTextures(device: device)
+            configManager.loadMTLBuffers(device: device)
+            DispatchQueue.main.async {
+                completion()
+            }
+        }
     }
     
     private func hwd_appropriateDurationForFrame(_ frame: PCMP4AnimatedImageFrame) -> TimeInterval {
@@ -883,7 +953,10 @@ public extension UIView {
         
         // 修复：与 OC 版本保持一致，检查类型和索引
         // OC: if (!nextFrame || nextFrame.frameIndex != nextIndex || ![nextFrame isKindOfClass:[QGMP4AnimatedImageFrame class]])
-        let rawFrame = decodeManager.consumeDecodedFrame(nextIndex)
+        guard let rawFrame = decodeManager.consumeDecodedFrame(nextIndex) else {
+            PCVAPError(kPCVAPModuleCommon, "hwd_displayNext: consumeDecodedFrame(\(nextIndex)) returned wrong type: \(nextIndex)")
+            return nil
+        }
         
         guard let nextFrame = rawFrame as? PCMP4AnimatedImageFrame else {
             // 没取到预期的帧 - 添加详细日志
@@ -925,12 +998,14 @@ public extension UIView {
         
         hwd_currentFrameInstance = nextFrame
         
+        let delegate = hwd_delegateSnapshot()
+        let currentFrame = hwd_currentFrame
         hwd_callbackQueue?.addOperation {
             if nextIndex == 0 {
-                self.hwd_Delegate?.viewDidStartPlayMP4(self)
+                delegate?.viewDidStartPlayMP4(self)
             }
-            // 此处必须延迟释放，避免野指针
-            self.hwd_Delegate?.viewDidPlayMP4AtFrame(self.hwd_currentFrame!, view: self)
+            // 异步回调时可能已 stop 并清空 currentFrame，以 nil 通知 delegate
+            delegate?.viewDidPlayMP4AtFrame(currentFrame, view: self)
         }
         
         return nextFrame
@@ -954,10 +1029,18 @@ extension UIView: AnimatedImageDecoderDelegate {
     }
     
     func decoderDidFailDecode(_ decoder: PCBaseDecoder, error: Error) {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async {
+                self.decoderDidFailDecode(decoder, error: error)
+            }
+            return
+        }
+
         PCVAPError(kPCVAPModuleCommon, "decoderDidFailDecode:\(error)")
+        let delegate = hwd_delegateSnapshot()
         hwd_stopHWDMP4()
         hwd_callbackQueue?.addOperation {
-            self.hwd_Delegate?.viewDidFailPlayMP4(error)
+            delegate?.viewDidFailPlayMP4(error)
         }
     }
 }
@@ -976,7 +1059,14 @@ extension UIView: AudioPlaybackPositionDelegate {
 extension UIView: PCHWDMetelViewDelegate, PCVAPMetalViewDelegate {
     func onMetalViewUnavailable() {
         PCVAPError(kPCVAPModuleCommon, "onMetalViewUnavailable")
-        stopHWDMP4()
+        switch hwd_enterBackgroundOP {
+        case .stop:
+            stopHWDMP4()
+        case .pauseAndResume:
+            pauseHWDMP4()
+        case .doNothing:
+            break
+        }
     }
 }
 
@@ -984,10 +1074,18 @@ extension UIView: PCHWDMetelViewDelegate, PCVAPMetalViewDelegate {
 
 extension UIView: VAPConfigDelegate {
     func onVAPConfigResourcesLoaded(_ config: PCVAPConfigModel, error: Error?) {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async {
+                self.onVAPConfigResourcesLoaded(config, error: error)
+            }
+            return
+        }
+
         if let error = error {
             PCVAPError(kPCVAPModuleCommon, "onVAPConfigResourcesLoaded error: \(error.localizedDescription)")
+            let delegate = hwd_delegateSnapshot()
             hwd_callbackQueue?.addOperation {
-                self.hwd_Delegate?.viewDidFailPlayMP4(error)
+                delegate?.viewDidFailPlayMP4(error)
             }
             hwd_stopHWDMP4()
             return
@@ -997,35 +1095,45 @@ extension UIView: VAPConfigDelegate {
         if hwd_decodeManager == nil {
             let error = NSError(domain: "PCVapPlayer", code: -1, userInfo: [NSLocalizedDescriptionKey: "解码器初始化失败，无法播放视频"])
             PCVAPError(kPCVAPModuleCommon, "onVAPConfigResourcesLoaded: decodeManager is nil, cannot start playback")
+            let delegate = hwd_delegateSnapshot()
             hwd_callbackQueue?.addOperation {
-                self.hwd_Delegate?.viewDidFailPlayMP4(error)
+                delegate?.viewDidFailPlayMP4(error)
             }
             hwd_stopHWDMP4()
             return
         }
         
-        PCVAPInfo(kPCVAPModuleCommon, "onVAPConfigResourcesLoaded success, starting render")
-        hwd_loadMetalDataIfNeed()
-        
-        if let delegate = hwd_Delegate {
-            // 直接调用，如果未实现会使用协议扩展的默认实现（返回 true）
-            let shouldStart = delegate.shouldStartPlayMP4(self, config: config)
-            if !shouldStart {
-                PCVAPEvent(kPCVAPModuleCommon, "shouldStartPlayMP4 return no!")
-                hwd_stopHWDMP4()
+        PCVAPInfo(kPCVAPModuleCommon, "onVAPConfigResourcesLoaded success, loading metal resources")
+        hwd_loadMetalDataIfNeed { [weak self] in
+            guard let self = self else { return }
+            if self.hwd_isFinish || self.hwd_decodeManager == nil {
                 return
             }
+            if let delegate = self.hwd_delegateSnapshot() {
+                let shouldStart = delegate.shouldStartPlayMP4(self, config: config)
+                if !shouldStart {
+                    PCVAPEvent(kPCVAPModuleCommon, "shouldStartPlayMP4 return no!")
+                    self.hwd_stopHWDMP4()
+                    return
+                }
+            }
+            PCVAPInfo(kPCVAPModuleCommon, "metal resources ready, starting render")
+            self.hwd_renderVideoRun()
         }
-        hwd_renderVideoRun()
     }
     
-    func vapContent(forTag tag: String, resource info: VAPSourceInfo) -> String? {
-        return hwd_Delegate?.contentForVapTag(tag, resource: info)
+    /// 协议要求的方法名：ConfigManager 调用的是 vap_contentForTag，必须用此名才能转发到 PCHWDMP4PlayDelegate
+    func vap_contentForTag(_ tag: String, resource: VAPSourceInfo) -> Any? {
+        return hwd_delegateSnapshot()?.contentForVapTag(tag, resource: resource)
     }
     
-    func vapLoadImage(withURL urlStr: String, context: [String: Any]?, completion: @escaping PCVAPImageCompletionBlock) {
-        // 直接调用，如果未实现会使用协议扩展的默认实现（空实现）
-        hwd_Delegate?.loadVapImage(withURL: urlStr, context: context, completion: completion)
+    /// 协议要求的方法名：ConfigManager 调用的是 vap_loadImage(with:context:completion:)，必须用此名才能转发
+    func vap_loadImage(with urlStr: String, context: [String: Any], completion: @escaping PCVAPImageCompletionBlock) {
+        if let delegate = hwd_delegateSnapshot() {
+            delegate.loadVapImage(withURL: urlStr, context: context, completion: completion)
+        } else {
+            completion(nil, NSError(domain: "PCVapPlayer", code: -1, userInfo: [NSLocalizedDescriptionKey: "Not implemented"]), urlStr)
+        }
     }
 }
 
@@ -1066,7 +1174,7 @@ extension UIView {
     
     /// 增加点击的手势识别
     /// - Parameter handler: 点击事件回调
-    func addVapTapGesture(_ handler: @escaping PCVAPGestureEventBlock) {
+    public func addVapTapGesture(_ handler: @escaping PCVAPGestureEventBlock) {
         // 如果是 PCVAPWrapView，转发给内部的 vapView
         if let wrapView = self as? PCVAPWrapView {
             wrapView.initPCVAPViewIfNeed()
@@ -1084,22 +1192,16 @@ extension UIView {
     func displayingSource(at point: CGPoint) -> PCVAPSourceDisplayItem? {
         guard let configManager = hwd_configManager,
               let model = configManager.model,
-              let currentFrame = hwd_currentFrame else {
-            return nil
-        }
+              let currentFrame = hwd_currentFrame else { return nil }
         
-        guard var mergeInfos = model.mergedConfig[currentFrame.frameIndex] else {
-            return nil
-        }
+        guard var mergeInfos = model.mergedConfig[currentFrame.frameIndex] else { return nil }
         
         // 按 renderIndex 降序排序（从后往前，后渲染的在上面）
         mergeInfos.sort { $0.renderIndex > $1.renderIndex }
         
         guard let renderingPixelSize = model.info?.size,
               renderingPixelSize.width > 0,
-              renderingPixelSize.height > 0 else {
-            return nil
-        }
+              renderingPixelSize.height > 0 else { return nil }
         
         let viewSize = frame.size
         let xRatio = viewSize.width / renderingPixelSize.width
@@ -1124,9 +1226,7 @@ extension UIView {
             }
         }
         
-        guard let mergeInfo = targetMergeInfo else {
-            return nil
-        }
+        guard let mergeInfo = targetMergeInfo else { return nil }
         
         let displayItem = PCVAPSourceDisplayItem()
         displayItem.sourceInfo = mergeInfo.source
@@ -1139,7 +1239,7 @@ extension UIView {
 
 public extension UIView {
     private struct VAPMaskAssociatedKeys {
-        static var maskInfo = "PCVAPMaskInfo"
+        static var maskInfo: UInt8 = 0
     }
     
     /// VAP 遮罩信息
